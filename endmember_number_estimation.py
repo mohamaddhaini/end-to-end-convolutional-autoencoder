@@ -1,3 +1,5 @@
+"""Utilities for estimating hyperspectral noise statistics and subspace size."""
+
 import numpy as np
 import scipy 
 from spectral import*
@@ -10,29 +12,38 @@ from sklearn.preprocessing import MinMaxScaler
 
 def est_noise(y, noise_type='additive'):
     """
-    This function infers the noise in a
-    hyperspectral data set, by assuming that the
-    reflectance at a given band is well modelled
-    by a linear regression on the remaining bands.
+    Infer hyperspectral noise by regressing each band against all others.
 
-    Parameters:
-        y: `numpy array`
-            a HSI cube ((m*n) x p)
+    Parameters
+    ----------
+    y : numpy.ndarray
+        Hyperspectral cube reshaped as ``((m*n) x p)``.
+    noise_type : str, optional
+        Either ``'additive'`` or ``'poisson'`` depending on the assumed noise.
 
-       noise_type: `string [optional 'additive'|'poisson']`
-
-    Returns: `tuple numpy array, numpy array`
-        * the noise estimates for every pixel (N x p)
-        * the noise correlation matrix estimates (p x p)
-
-    Copyright:
-        Jose Nascimento (zen@isel.pt) and Jose Bioucas-Dias (bioucas@lx.it.pt)
-        For any comments contact the authors
+    Returns
+    -------
+    tuple[numpy.ndarray, numpy.ndarray]
+        Estimated noise samples for every pixel and the corresponding
+        correlation matrix.
     """
     def est_additive_noise(r):
+        """
+        Estimate additive noise statistics via leave-one-band-out regression.
+
+        Parameters
+        ----------
+        r : numpy.ndarray
+            Matrix of shape ``(bands, pixels)`` representing spectra.
+
+        Returns
+        -------
+        tuple[numpy.ndarray, numpy.ndarray]
+            Estimated noise samples and their covariance matrix.
+        """
         small = 1e-6
         L, N = r.shape
-        w=np.zeros((L,N), dtype=np.float)
+        w=np.zeros((L,N), dtype=float)
         RR=np.dot(r,r.T)
         RRi = np.linalg.pinv(RR+small*np.eye(L))
         RRi = np.matrix(RRi)
@@ -41,21 +52,19 @@ def est_noise(y, noise_type='additive'):
             RRa = RR[:,i]
             RRa[i] = 0
             beta = np.dot(XX, RRa)
-            beta[0,i]=0;
+            beta[0,i]=0
             w[i,:] = r[i,:] - np.dot(beta,r)
         Rw = np.diag(np.diag(np.dot(w,w.T) / N))
         return w, Rw
 
     y = y.T
     L, N = y.shape
-    #verb = 'poisson'
     if noise_type == 'poisson':
         sqy = np.sqrt(y * (y > 0))
         u, Ru = est_additive_noise(sqy)
         x = (sqy - u)**2
         w = np.sqrt(x)*u*2
         Rw = np.dot(w,w.T) / N
-    # additive
     else:
         w, Rw = est_additive_noise(y)
     return w.T, Rw.T
@@ -63,28 +72,22 @@ def est_noise(y, noise_type='additive'):
 
 def hysime(y, n, Rn):
     """
-    Hyperspectral signal subspace estimation
+    Estimate the signal subspace dimension using the HySime algorithm.
 
-    Parameters:
-        y: `numpy array`
-            hyperspectral data set (each row is a pixel)
-            with ((m*n) x p), where p is the number of bands
-            and (m*n) the number of pixels.
+    Parameters
+    ----------
+    y : numpy.ndarray
+        Hyperspectral data set with shape ``((m*n) x p)``.
+    n : numpy.ndarray
+        Estimated noise with the same shape as ``y``.
+    Rn : numpy.ndarray
+        Noise correlation matrix with shape ``(p x p)``.
 
-        n: `numpy array`
-            ((m*n) x p) matrix with the noise in each pixel.
-
-        Rn: `numpy array`
-            noise correlation matrix (p x p)
-
-    Returns: `tuple integer, numpy array`
-        * kf signal subspace dimension
-        * Ek matrix which columns are the eigenvectors that span
-          the signal subspace.
-
-    Copyright:
-        Jose Nascimento (zen@isel.pt) & Jose Bioucas-Dias (bioucas@lx.it.pt)
-        For any comments contact the authors
+    Returns
+    -------
+    tuple[int, numpy.ndarray, numpy.ndarray, numpy.ndarray]
+        Estimated subspace dimension, the eigenvectors spanning the subspace,
+        the full eigenvector matrix, and the HySime cost for each component.
     """
     y=y.T
     n=n.T
@@ -93,7 +96,7 @@ def hysime(y, n, Rn):
     Ln, Nn = n.shape
     d1, d2 = Rn.shape
 
-    x = y - n;
+    x = y - n
 
     Ry = np.dot(y, y.T) / N
     Rx = np.dot(x, x.T) / N

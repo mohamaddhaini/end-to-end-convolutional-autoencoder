@@ -1,36 +1,62 @@
-import torch.utils.data
-from torch.autograd import Variable
-import torch
-from torch import nn
-import numpy as np
-import scipy 
-import os
-import matplotlib.pyplot as plt
-import pandas as pd
-import random
+"""Convolutional autoencoder components for nonlinear hyperspectral unmixing."""
+
 import math
-import tqdm
-from sklearn.svm import SVC
+import os
+import random
+import time
+
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import scipy
+import torch
+import torch.nn.functional as F
+import torch.utils.data
 from barbar import Bar
 from pysptools import eea
-import time
-from spectral import*
+from sklearn.linear_model import LinearRegression
 from sklearn.metrics import r2_score
 from sklearn.preprocessing import MinMaxScaler
-from sklearn.linear_model import LinearRegression
-import torch.nn.functional as F
-from torch.optim.lr_scheduler import StepLR
-from torch.optim.lr_scheduler import ReduceLROnPlateau,StepLR
-import math
+from sklearn.svm import SVC
+from spectral import *
+from torch import nn
+from torch.autograd import Variable
+from torch.optim.lr_scheduler import ReduceLROnPlateau, StepLR
 from torch.utils.tensorboard import SummaryWriter
 
 def swish(x):
-    """  swish activation function"""
+    """
+    Compute the swish activation (x * sigmoid(x)).
+
+    Parameters
+    ----------
+    x : torch.Tensor
+        Tensor that will be transformed element-wise.
+
+    Returns
+    -------
+    torch.Tensor
+        Activated tensor with the same shape as ``x``.
+    """
     return x * torch.sigmoid(x)
 
 
 def spectral_div(x,y):
-    """  Spectral Information Divergence Loss """
+    """
+    Compute the spectral information divergence between two spectra.
+
+    Parameters
+    ----------
+    x : torch.Tensor
+        First batch of spectra with shape ``(batch, wavelength)``.
+    y : torch.Tensor
+        Second batch of spectra with the same shape as ``x``.
+
+    Returns
+    -------
+    torch.Tensor
+        Scalar tensor containing the divergence value.
+    """
     x = torch.clip(x,min=0.001)
     y = torch.clip(y,min=0.001)
     sum_x=torch.sum(x,dim=1)
@@ -42,118 +68,136 @@ def spectral_div(x,y):
 
 
 def spectral_distance(x,y):
-    """ Spectral Distance Loss Function """
+    """
+    Compute the average angular error between spectra.
+
+    Parameters
+    ----------
+    x : torch.Tensor
+        First batch of spectra with shape ``(batch, wavelength)``.
+    y : torch.Tensor
+        Second batch of spectra with the same shape as ``x``.
+
+    Returns
+    -------
+    torch.Tensor
+        Scalar tensor representing the mean angular distance.
+    """
     loss=torch.mean(torch.acos(torch.diag(torch.mm(x,y.T),0)/(torch.norm(x,dim=1)*torch.norm(y,dim=1))))
     return loss
 
 
 
 def RMSELoss(yhat,y):
-    """ Root Mean Squared Error """
+    """
+    Compute the root mean squared error loss between predictions and targets.
+
+    Parameters
+    ----------
+    yhat : torch.Tensor
+        Predicted spectra.
+    y : torch.Tensor
+        Ground-truth spectra.
+
+    Returns
+    -------
+    torch.Tensor
+        Scalar tensor containing the RMSE.
+    """
     return torch.sqrt(torch.mean((yhat-y)**2))
 
 
 
 def MSELos(yhat,y):
-    """  Mean Squared Error """
+    """
+    Compute the mean squared error loss between predictions and targets.
+
+    Parameters
+    ----------
+    yhat : torch.Tensor
+        Predicted spectra.
+    y : torch.Tensor
+        Ground-truth spectra.
+
+    Returns
+    -------
+    torch.Tensor
+        Scalar tensor containing the MSE.
+    """
     return torch.mean((yhat-y)**2)
 
 
 class ConvAutoencoder(nn.Module):
     """
-    ConvAutoEncoder Class 
-    
-    Attributes
-    ----------
-    nb_channel : int
-        specifies the number of wavelengths of a spectrum (usually 288)
-        
-    nb_endm : int
-        specify number of endmembers to extract
-        
-    bases : torch tensor(nb_channel,nb_endm)
-        Endmember Matrix
-        
-    abundanes: boolean
-        if true return Abundances
-        
-    nonlinear: boolean
-        if true return nonlinear output
-    Returns
-    ---------
-    3 options depending on Abundances and nonlinear
-    
-    if abundances =True 
-        return Abundances (batch_size,nb_endm)
+    Convolutional autoencoder used for nonlinear hyperspectral unmixing.
 
-    if nonlinear =True 
-        return nonlinear output (batch_size,nb_channel)
-     if nonlinear =True 
-        return linear output (batch_size,nb_channel)
-    if  both are False
-        return reconstructed spectrum (linear+nonlinear)
+    The encoder progressively downsamples the input spectrum to estimate
+    abundances while the decoder reconstructs both linear and nonlinear
+    components using the learned abundances and the provided endmember bases.
     """
     def __init__(self, nb_channel, basis, nb_endm):
+        """
+        Parameters
+        ----------
+        nb_channel : int
+            Number of wavelength samples in each spectrum.
+        basis : torch.Tensor
+            Tensor of shape ``(nb_channel, nb_endm)`` containing the endmember
+            signatures used by the decoder.
+        nb_endm : int
+            Number of endmembers (i.e., abundances) to predict.
+        """
         super(ConvAutoencoder, self).__init__()
         self.basis=basis
         self.nb_channel = nb_channel
-        # self.length = length
         self.nb_endm = nb_endm
-        """ Layer 1"""
-        # Conv Layer
         self.conv1 = nn.Conv1d(1,16,3,stride=2)
-        # torch.nn.init.xavier_normal_(self.conv1.weight)
-        # Maxpool Layer
         self.max1 = nn.MaxPool1d(kernel_size=2,stride=1)
-        # BatchNormalization
         self.batch1=nn.BatchNorm1d(16)
-        """ Layer 2"""
-        # Conv Layer
         self.conv2 = nn.Conv1d(16,32,3, padding=0,stride=2)
-        # torch.nn.init.xavier_normal_(self.conv2.weight)
-        # Maxpool Layer
         self.max2 = nn.MaxPool1d(kernel_size=2,stride=1)
-        # BatchNormalization
         self.batch2=nn.BatchNorm1d(32)
-        """ Layer 3"""
-        # Conv Layer
         self.conv3 = nn.Conv1d(32,64,3, stride=2)
-        # torch.nn.init.xavier_normal_(self.conv3.weight)
-        # Maxpool Layer
         self.max3 = nn.MaxPool1d(kernel_size=2,stride=1)
-        # BatchNormalization
         self.batch3=nn.BatchNorm1d(64)
-        """ Linear Layers"""
         test_size=(((((self.max3(self.conv3(self.max2(self.conv2(self.max1(self.conv1(torch.rand(1,1,self.nb_channel))))))))))))
         
         self.convll1= nn.Conv1d(64, nb_endm,math.floor(test_size.shape[2]))
         self.batch6=nn.BatchNorm1d(nb_endm)
         self.convll2= nn.Conv1d(nb_endm, nb_endm,test_size.shape[2]-math.floor(test_size.shape[2]/2))
-        # torch.nn.init.xavier_normal_(self.convll1.weight)
         self.ll1=nn.Linear(test_size.shape[1]*test_size.shape[2],256,bias=True)
-        # torch.nn.init.xavier_normal_(self.ll1.weight)
         self.ll2=nn.Linear(256,nb_endm,bias=True)
-        # torch.nn.init.xavier_normal_(self.ll2.weight)
-        # torch.nn.init.xavier_normal_(self.ll2.weight)
-        """ Dropout """
         self.drop=nn.Dropout(p=0.09)
-        """  Decoder"""
         self.weight=  nn.Parameter((self.basis.T))
 
         self.convnn= nn.Conv2d(1, 32,(5,nb_endm), stride=(1,1))
-        # torch.nn.init.xavier_normal_(self.convnn.weight)
         self.convnn1= nn.Conv1d(32, 32,5, stride=1)
-        # torch.nn.init.xavier_normal_(self.convnn1.weight)
         self.convnn2= nn.Conv1d(32, 32,5, stride=1)
         test=(self.convnn(torch.rand(1,1,nb_channel,nb_endm)))
         test_=(self.convnn2(self.convnn1(test.reshape(-1,test.shape[1],test.shape[2]))))
         self.convnn3= nn.Linear(test_.shape[1]*test_.shape[2], nb_channel,bias=True)
-        # torch.nn.init.xavier_normal_(self.convnn2.weight)
-        #..........................................
         
     def forward(self, x,linear,abundances,nonlinear):
-        
-        """ Encoder """
+        """
+        Run the encoder and decoder to produce abundances and reconstructions.
+
+        Parameters
+        ----------
+        x : torch.Tensor
+            Input spectra with shape ``(batch, 1, nb_channel)``.
+        linear : bool
+            If ``True`` return only the linear reconstruction.
+        abundances : bool
+            If ``True`` return the abundance vector.
+        nonlinear : bool
+            If ``True`` return only the nonlinear reconstruction.
+
+        Returns
+        -------
+        torch.Tensor
+            Abundances, linear component, nonlinear component, or their sum
+            depending on the provided boolean flags.
+        """
         x = (self.conv1(x))
         x = F.relu(self.max1(x))
         x = (self.conv2(x))
@@ -164,21 +208,14 @@ class ConvAutoencoder(nn.Module):
         x =  nn.Flatten()(x)
         x = (self.ll1(x))
         x = (self.ll2(x))
-        # print(x.shape)
         x_ =  nn.Flatten()(x)
-        """  Absolute Value Rectification """
         
         x = torch.abs(x_)
-        # x = (x.T/torch.sum(x,dim=1)).T
-        # x = F.softmax(x_,1)
-        
-        """ Decoder """
+
         inter=(torch.unsqueeze(x,1)*self.weight.T)
         
-        ### Linear Output
         xlin_=torch.sum(inter,2)
         
-        ### Nonlinear Output
         array=torch.unsqueeze(inter,1)
         x2_= (self.convnn(array))
         x2_=x2_.reshape(-1,x2_.shape[1],x2_.shape[2])
@@ -186,10 +223,7 @@ class ConvAutoencoder(nn.Module):
         x2_= (self.convnn2(x2_))
         
         x2_=x2_.reshape(-1,x2_.shape[1]*x2_.shape[2])
-        # print(x2_.shape)
         x2_= (self.convnn3(x2_))
-        #..........................................
-        """ Return Output """        
         if abundances:
             return x
         if nonlinear:
@@ -203,36 +237,37 @@ class ConvAutoencoder(nn.Module):
 
 def train_nn(n_epochs,model,optimizer,train_loader,valid_loader,nonlinear_weights_lamda,smoothing,path,name,device,linear):
     """
-    Attributes
+    Train the autoencoder while tracking training/validation losses.
+
+    Parameters
     ----------
-    n_epochs: int
-        number of full cycles over training data
-    
-    model: instance of ConvAutoEncoder 
-    
-    optimizer: An Algorithm of torch.optim  https://pytorch.org/docs/stable/optim.html
-    
-    train_loader: Torch Datalaoder for training data https://pytorch.org/docs/stable/data.html
-    
-    valid_loader: Torch Datalaoder for testing data
-    
-    nonlinear_weights_lamda: float
-        power of nonlinear output (often around 1e-3)
-    
-    smoothing: float
-        power of smoothing of endmembers (often around 1e-6)
-    
-    path: string
-        path of folder where model dictionary state to be saved
-        
-    name: string
-        name of saved model
-        
+    n_epochs : int
+        Number of optimization epochs.
+    model : ConvAutoencoder
+        Autoencoder model to optimize.
+    optimizer : torch.optim.Optimizer
+        Optimizer configured with the model parameters.
+    train_loader : torch.utils.data.DataLoader
+        Loader yielding training spectra.
+    valid_loader : torch.utils.data.DataLoader
+        Loader yielding validation spectra.
+    nonlinear_weights_lamda : float
+        Weight applied to the nonlinear regularization penalty.
+    smoothing : float
+        Weight applied to the endmember smoothing penalty.
+    path : str
+        Directory used to store tensorboard logs.
+    name : str
+        Run name (kept for backwards compatibility).
+    device : torch.device
+        Target device for training/inference.
+    linear : bool
+        Whether to request linear outputs from the model during optimization.
+
     Returns
-    -----------
-    train_loss: numpy.array (n_epochs)
-    valid_loss: numpy.array (n_epochs)
-    
+    -------
+    tuple[numpy.ndarray, numpy.ndarray]
+        Arrays containing the per-epoch training and validation losses.
     """
     writer = SummaryWriter(log_dir=os.path.join(path,'Tensorboard'))
     Loss = nn.MSELoss(reduction='sum')
@@ -246,11 +281,8 @@ def train_nn(n_epochs,model,optimizer,train_loader,valid_loader,nonlinear_weight
         for i, (p) in tqdm.tqdm(enumerate(train_loader), total=int(len(train_loader))):
             x = Variable(p).float().to(device)
             y = Variable(p).float().to(device)
-            # clear the gradients
             optimizer.zero_grad()
-            # forward pass
             outputs= model(x,linear,False,False)
-            # calculate the loss
             loss=torch.tensor(0.)
             loss_distance = spectral_distance(outputs.squeeze(), torch.squeeze(y))
             loss_mse=Loss(outputs, torch.squeeze(y))
@@ -260,35 +292,25 @@ def train_nn(n_epochs,model,optimizer,train_loader,valid_loader,nonlinear_weight
             divergence_lamda=0.7
             l2_reg = torch.tensor(0.).to(device)
             l1_reg = torch.tensor(0.).to(device)
-            # l1_reg +=torch.norm(model.weight2)
-            l2_lambda = smoothing
             for h in range(model.weight.shape[0]):
                         l2_reg +=torch.sum(torch.abs(model.weight[h,1:]-model.weight[h,:-1]))
             non_linear_comp=torch.norm(model.convnn3.weight)
             
             loss =  loss_div +nonlinear_weights_lamda*non_linear_comp+smoothing*l2_reg
-                # loss =  loss_mse +smoothing*l2_reg
-                # backward pass
             model.weight.data=model.weight.data.clamp(0)
             loss.backward()
-            # perform a single optimization step
             optimizer.step()
             loss_t+=loss.item()
             
             
-        """  validation loss after each epoch"""
         valid = 0.0
-        model.eval()     # Optional when not using Model Specific layer
+        model.eval()
         for data in valid_loader:
             data = data.float().to(device)
-            # Forward Pass
             target = model(data,linear,False,False)
-            # Find the Loss
             loss = spectral_div(target,data.squeeze())
-            # Calculate Loss
             valid += loss.item()
         scheduler.step(valid)
-        # optimizer.param_groups[0]["lr"]=optimizer.param_groups[0]["lr"]*0.98
         if valid/(len(valid_loader))<valid_res:
            valid_res=valid/(len(valid_loader))
            torch.save(model.state_dict(), os.path.join(path,name))
@@ -299,7 +321,6 @@ def train_nn(n_epochs,model,optimizer,train_loader,valid_loader,nonlinear_weight
         fig=plt.figure()
         plt.plot(model.weight.cpu().detach().numpy().T)
         writer.add_figure('Basis',fig,global_step=epoch)
-        # scheduler.step()
         epoch=epoch+1 
         train_loss.append(loss_t/len(train_loader))
         valid_loss.append(valid_res)
@@ -307,18 +328,24 @@ def train_nn(n_epochs,model,optimizer,train_loader,valid_loader,nonlinear_weight
     return np.array(train_loss),np.array(valid_loss)
 
 def get_abundances(model,test_loader,device,linear):
-    
-    """"
-    Attributes
+    """
+    Estimate the abundance vectors for the provided spectra.
+
+    Parameters
     ----------
-    model: trained version of ConvAutoEncoder
-    
-    test_loader: torch Dataloader with test data
-    
+    model : ConvAutoencoder
+        Trained model used for inference.
+    test_loader : torch.utils.data.DataLoader
+        Loader providing spectra from which to extract abundances.
+    device : torch.device
+        Device on which inference is executed.
+    linear : bool
+        Whether to request the linear reconstruction in addition to abundances.
+
     Returns
-    -----------
-    outputs: numpy.array (len(test_loader)*batch_size,nb_endm)
-    
+    -------
+    numpy.ndarray
+        Array containing the stacked abundance predictions.
     """
     model.eval()
     for i, (x) in enumerate(test_loader):
@@ -335,42 +362,35 @@ def get_abundances(model,test_loader,device,linear):
 
 
 def decode(model,abundances,device):
-    """"
-    Attributes
-    ----------
-    model: trained version of ConvAutoEncoder
-    
-    abundances: output of  get_abundances function
+    """
+    Reconstruct spectra from abundances using the trained decoder branch.
 
-    device: torch.device()
-    
+    Parameters
+    ----------
+    model : ConvAutoencoder
+        Trained autoencoder whose decoder will be reused.
+    abundances : torch.Tensor or numpy.ndarray
+        Abundance matrix with shape ``(samples, nb_endm)``.
+    device : torch.device
+        Device on which to run the decoder.
+
     Returns
-    -----------
-    outputs: 
-    
-    x1: torch.tensor (abundances.shape[0],nb_channel)
-        linear output
-    x2: torch.tensor (abundances.shape[0],nb_channel)
-        nonlinear output
-    x3: torch.tensor (abundances.shape[0],nb_channel)
-        linear + nonlinear output
-    
+    -------
+    tuple[numpy.ndarray, numpy.ndarray, numpy.ndarray]
+        Linear reconstruction, nonlinear reconstruction, and their sum.
     """
 
     def decoder(model,abundances):
-        # x=torch.from_numpy(abundances).cpu()
+        """Decode a batch of abundances into linear, nonlinear, and combined outputs."""
         model=model.to(device)
-        inter=(torch.unsqueeze(x,1)*model.weight.T)
-        ### Linear Output
+        inter=(torch.unsqueeze(abundances,1)*model.weight.T)
         xlin_=torch.sum(inter,2)
-        ### Nonlinear Output
         array=torch.unsqueeze(inter,1)
         x2_= (model.convnn(array))
         x2_=x2_.reshape(-1,x2_.shape[1],x2_.shape[2])
         x2_= (model.convnn1(x2_))
         x2_= (model.convnn2(x2_))
         x2_=x2_.reshape(-1,x2_.shape[1]*x2_.shape[2])
-        # print(x2_.shape)
         x2_= (model.convnn3(x2_))
         return xlin_,x2_,xlin_+x2_
     
@@ -392,18 +412,30 @@ def decode(model,abundances,device):
 
 
 def clean_image(image,bands,threshold_min,threshold_max,swir=True,bands_min=1136,bands_max=2413):
-    """"
-    Attributes
+    """
+    Remove noisy spectral bands and extreme pixels from an HSI cube.
+
+    Parameters
     ----------
-    image : numpy.array (rows,cols,bands)
-    
-    bands : numpy.array np.array(hdr.bands.centers)
-    
-    Return
-    ---------
-    image : numpy.array (rows,cols,new_bands)
-    mask: numpy.array(rows,cols)
-    
+    image : numpy.ndarray
+        Hyperspectral cube in ``(rows, cols, bands)`` or ``(pixels, bands)``.
+    bands : numpy.ndarray
+        Center wavelength of each band.
+    threshold_min : float
+        Lower quantile threshold (between 0 and 1) used to mask dark pixels.
+    threshold_max : float
+        Upper quantile threshold used to mask overly bright pixels.
+    swir : bool, default True
+        If ``True`` clip bands outside ``[bands_min, bands_max]``.
+    bands_min : int, default 1136
+        Minimum wavelength to keep when ``swir`` is ``True``.
+    bands_max : int, default 2413
+        Maximum wavelength to keep when ``swir`` is ``True``.
+
+    Returns
+    -------
+    tuple[numpy.ndarray, numpy.ndarray]
+        Filtered image and a boolean mask marking removed pixels.
     """
     if swir:
         noise1=(bands<bands_min)
